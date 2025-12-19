@@ -1,0 +1,157 @@
+
+name: Playwright Tests
+
+on:
+  push:
+    branches:[ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+
+  # 1️⃣ Detect Branch & Map to Environment
+  detect-env:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set_env.outputs.env }}
+      branch: ${{ steps.set_env.outputs.branch }}
+      use_browserstack: ${{ steps.set_env.outputs.use_browserstack }}
+
+    steps:
+      - name: Detect environment from branch
+        id: set_env
+        shell: bash
+        run: |
+          BRANCH_NAME="${{ GITHUB_REF##*/ }}"
+          echo "Detected branch: $BRANCH_NAME"
+
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            ENV="prod"
+            USE_BROWSERSTACK="false"
+          elif [[ "$BRANCH_NAME" == "develop" ]]; then
+            ENV="qa"
+            USE_BROWSERSTACK="false"
+          else
+            ENV="qa"
+            USE_BROWSERSTACK="false"
+          fi
+
+          echo "ENV=$ENV" >> $GITHUB_ENV
+          echo "USE_BROWSERSTACK=$USE_BROWSERSTACK" >> $GITHUB_ENV
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+          echo "env=$ENV" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "use_browserstack=$USE_BROWSERSTACK" >> $GITHUB_OUTPUT
+
+
+  # 2️⃣ Extract Tags from Commit Message
+  extract-tags:
+    runs-on: ubuntu-latest
+    needs: detect-env
+    outputs:
+      tags: ${{ steps.extract_tags.outputs.tags }}
+      
+    steps:
+      - name: Extract tags from commit message
+        id: extract_tags
+        shell: bash
+        run: |
+          COMMIT_MESSAGE="${{ github.event.head_commit.message }}"
+          echo "Commit message: $COMMIT_MESSAGE"
+
+          TAGS=$(echo "$COMMIT_MESSAGE" | grep -oP '@\w+' | tr '[:upper:]' '[:lower:]' | paste -sd'|' -)
+          echo "Extracted tags: $TAGS"
+
+          if [ -n "$TAGS" ]; then
+            echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          else
+            echo "tags=" >> $GITHUB_OUTPUT
+          fi
+
+
+  # 3️⃣ Run Playwright Tests
+  run-tests:
+    runs-on: ubuntu-latest
+    needs: [detect-env, extract-tags]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [ main, develop ]
+
+    timeout-minutes: 60
+
+    env:
+      PROJECT: ${{ matrix.project }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies & browsers
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Set environment variables
+        env:
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+          BROWSERSTACK_BUILD_NAME: "Perflow-Build-${{ github.run_id }}"
+        run: echo "Environment variables set"
+
+      # ----------------------
+      # SMOKE
+      # ----------------------
+      - name: Run Smoke tests
+        if: needs.detect-env.outputs.use_browserstack == 'false'
+        env:
+          ENV: ${{ needs.detect-env.outputs.environment }}
+          BRANCH: ${{ needs.detect-env.outputs.branch }}
+          TESTING_TYPE: smoke
+        run: |
+          TAGS="${{ needs.extract-tags.outputs.tags }}"
+          FILTER="@smoke"
+          if [ -n "$TAGS" ]; then FILTER="($FILTER)|($TAGS)"; fi
+          npx playwright test --grep "$FILTER" --project=$PROJECT --workers=4
+
+
+      # ----------------------
+      # REGRESSION
+      # ----------------------
+      - name: Run REGRESSION tests
+        if: success()
+        env:
+          ENV: ${{ needs.detect-env.outputs.environment }}
+          BRANCH: ${{ needs.detect-env.outputs.branch }}
+          TESTING_TYPE: regression
+        run: |
+          npx playwright test --grep "@regression" --project=$PROJECT --workers=4
+
+
+      # ----------------------
+      # SANITY
+      # ----------------------
+      - name: Run SANITY tests
+        if: success()
+        env:
+          ENV: ${{ needs.detect-env.outputs.environment }}
+          BRANCH: ${{ needs.detect-env.outputs.branch }}
+          TESTING_TYPE: sanity
+        run: |
+          npx playwright test --project=$PROJECT --workers=4
+
+
+      # ----------------------
+      # REPORT UPLOAD
+      # ----------------------
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.project }}
+          path: playwright-report/
+          retention-days: 30
